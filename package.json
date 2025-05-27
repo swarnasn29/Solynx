@@ -31,6 +31,8 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@types/formidable": "^3.4.5",
+    "@types/fs-extra": "^11.0.4",
     "@types/mime-types": "^2.1.4",
     "@types/node": "^20",
     "@types/react": "^19",

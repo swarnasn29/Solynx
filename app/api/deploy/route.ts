@@ -26,16 +26,17 @@ async function parseFormData(req: Request) {
   }
 
   const buffer = Buffer.from(await req.arrayBuffer());
-  const stream = Readable.from(buffer);
   
-  // Add required headers that formidable expects
-  const headers = {
-    'content-type': contentType,
-    'content-length': buffer.length.toString()
+  // Create a mock request object with the required headers
+  const mockReq = {
+    headers: {
+      'content-type': contentType,
+      'content-length': buffer.length.toString()
+    }
   };
 
   return new Promise<{ fields: any, files: any }>((resolve, reject) => {
-    form.parse(stream, { headers }, (err: any, fields: any, files: any) => {
+    form.parse(mockReq as any, (err: any, fields: any, files: any) => {
       if (err) reject(err);
       else resolve({ fields, files });
     });
