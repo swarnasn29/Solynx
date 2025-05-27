@@ -1,0 +1,294 @@
+import Arweave from 'arweave';
+import fs from 'fs';
+import path from 'path';
+import mime from 'mime-types';
+import { readJWKFile, arDriveFactory, wrapFileOrFolder, ArweaveWallet } from 'ardrive-core-js';
+
+// Initialize Arweave
+const arweave = Arweave.init({
+  host: 'ar-io.net',
+  port: 443,
+  protocol: 'https'
+});
+
+export interface ArweaveDeploymentResult {
+  success: boolean;
+  transactionId?: string;
+  url?: string;
+  error?: string;
+  fileTransactions: Record<string, string>;
+  fileUrls: Array<{ path: string; url: string }>;
+}
+
+export async function deployToArweave(
+  buildDir: string, 
+  walletJwk: any, 
+  tags: Array<{ name: string; value: string }> = []
+): Promise<ArweaveDeploymentResult> {
+  try {
+    // Prepare manifest for Arweave Path Manifest (for website navigation)
+    const paths: Record<string, { id: string }> = {};
+    const fileTransactions: Record<string, string> = {};
+    const defaultTags = [
+      { name: 'Content-Type', value: 'application/x.arweave-manifest+json' },
+      { name: 'App-Name', value: 'Solynx' },
+      ...tags
+    ];
+
+    // First, upload all individual files
+    const files = await getAllFiles(buildDir);
+    
+    console.log(`Uploading ${files.length} files to Arweave...`);
+    
+    for (const file of files) {
+      const relativePath = path.relative(buildDir, file);
+      const contentType = mime.lookup(file) || 'application/octet-stream';
+      const data = fs.readFileSync(file);
+      
+      // Create transaction
+      const transaction = await arweave.createTransaction({ data }, walletJwk);
+      transaction.addTag('Content-Type', contentType);
+      
+      // Sign and submit
+      await arweave.transactions.sign(transaction, walletJwk);
+      await arweave.transactions.post(transaction);
+      
+      // Store the transaction ID
+      fileTransactions[relativePath] = transaction.id;
+      paths[relativePath === 'index.html' ? '' : relativePath] = { id: transaction.id };
+      
+      console.log(`Uploaded ${relativePath}: ${transaction.id}`);
+    }
+    
+    // Create and upload manifest
+    const manifest = {
+      manifest: 'arweave/paths',
+      version: '0.1.0',
+      index: {
+        path: 'index.html'
+      },
+      paths
+    };
+    console.log(JSON.stringify(manifest, null, 2));
+    const manifestTransaction = await arweave.createTransaction({
+      data: JSON.stringify(manifest)
+    }, walletJwk);
+    
+    // Add tags
+    defaultTags.forEach(({ name, value }) => {
+      manifestTransaction.addTag(name, value);
+    });
+    
+    // Sign and submit manifest
+    await arweave.transactions.sign(manifestTransaction, walletJwk);
+    const response = await arweave.transactions.post(manifestTransaction);
+    
+    if (response.status === 200 || response.status === 202) {
+      return {
+        success: true,
+        transactionId: manifestTransaction.id,
+        url: `https://ar-io.net/${manifestTransaction.id}`,
+        fileTransactions,
+        fileUrls: Object.entries(fileTransactions).map(([path, id]) => ({
+          path,
+          url: `https://ar-io.net/${id}`
+        }))
+      };
+    } else {
+      return {
+        success: false,
+        error: `Manifest deployment failed: ${response.statusText}`,
+        fileTransactions,
+        fileUrls: Object.entries(fileTransactions).map(([path, id]) => ({
+          path,
+          url: `https://ar-io.net/${id}`
+        }))
+      };
+    }
+  } catch (error: any) {
+    console.error('Arweave deployment failed:', error);
+    return {
+      success: false,
+      error: error.message,
+      fileTransactions: {},
+      fileUrls: []
+    };
+  }
+}
+
+// Helper to get all files recursively
+async function getAllFiles(dir: string): Promise<string[]> {
+  const result: string[] = [];
+  
+  const files = fs.readdirSync(dir);
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const stat = fs.statSync(filePath);
+    
+    if (stat.isDirectory()) {
+      const subDirFiles = await getAllFiles(filePath);
+      result.push(...subDirFiles);
+    } else {
+      result.push(filePath);
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Deploys a folder to Arweave using ArDrive Core JS.
+ * Handles drive creation, folder wrapping, and upload in a single function.
+ * Returns a result object compatible with ArweaveDeploymentResult.
+ *
+ * @param buildDir - The directory to upload (e.g., your static site build output)
+ * @param walletJwk - The Arweave wallet JWK object
+ * @param driveName - Name for the new ArDrive drive (default: 'Solynx-Drive')
+ */
+export async function deployToArweaveWithArDrive(
+  buildDir: string,
+  walletJwk: any,
+  driveName: string = 'Solynx-Drive'
+): Promise<ArweaveDeploymentResult> {
+  try {
+    // 1. Create an Arweave instance (already done at the top)
+    // 2. Create a wallet instance compatible with arDriveFactory
+    // arDriveFactory expects a wallet object with getPrivateKey, getAddress, etc.
+    // arweave.wallets.generate() returns a JWK, but arweave.wallets.jwkToAddress() can get the address.
+    // However, ardrive-core-js expects a wallet object, not just the JWK.
+
+    // The ardrive-core-js docs recommend using the JWK directly, but the error suggests otherwise.
+    // Let's try using the arweave instance and the JWK together.
+
+    // If arDriveFactory expects a wallet with getPrivateKey, you may need to use the arweave instance:
+    const wallet = ArweaveWallet(walletJwk);
+    const arDrive = arDriveFactory({ wallet, arweave });
+
+    // 2. Create a new public drive (each deployment gets a new drive)
+    const createDriveResult = await arDrive.createPublicDrive({ driveName });
+    const driveId = createDriveResult.driveId;
+    const rootFolderId = createDriveResult.rootFolderId;
+
+    // 3. Wrap the build directory and all its contents for upload
+    const wrappedFolder = wrapFileOrFolder(buildDir);
+
+    // 4. Upload the folder and all its contents to the root of the new drive
+    const uploadResult = await arDrive.uploadAllEntities({
+      entitiesToUpload: [
+        {
+          wrappedEntity: wrappedFolder,
+          destFolderId: rootFolderId
+        }
+      ]
+    });
+
+    // 5. Collect transaction IDs and URLs for all uploaded files
+    const fileTransactions: Record<string, string> = {};
+    const fileUrls: Array<{ path: string; url: string }> = [];
+    if (uploadResult.entityResults) {
+      for (const entity of uploadResult.entityResults) {
+        if (entity.entityPath && entity.entityTxId) {
+          fileTransactions[entity.entityPath] = entity.entityTxId;
+          fileUrls.push({
+            path: entity.entityPath,
+            url: `https://ar-io.net/${entity.entityTxId}`
+          });
+        }
+      }
+    }
+
+    // 6. Return a result object similar to the original deployment function
+    return {
+      success: true,
+      transactionId: driveId, // The driveId is the main reference for the deployment
+      url: `https://app.ardrive.io/#/drives/${driveId}`,
+      fileTransactions,
+      fileUrls
+    };
+  } catch (error: any) {
+    console.error('ArDrive deployment failed:', error);
+    return {
+      success: false,
+      error: error.message,
+      fileTransactions: {},
+      fileUrls: []
+    };
+  }
+}
+
+/**
+ * Uploads a folder structure to Arweave using ArDrive Core JS, mimicking the logic of the shell-based uploadToArweave.
+ * Accepts a wallet JWK object instead of a wallet path.
+ * Creates the drive, folders, and uploads files using the SDK.
+ *
+ * @param buildDir - The directory to upload (e.g., your static site build output)
+ * @param walletJwk - The Arweave wallet JWK object
+ * @param driveName - Name for the new ArDrive drive (default: 'Solynx-Drive')
+ * @returns An object with the rootFolderId and a map of all folder IDs
+ */
+export const uploadToArweave = async (
+  buildDir: string,
+  walletJwk: any,
+  driveName: string = 'Solynx-Drive'
+): Promise<ArweaveDeploymentResult>=> {
+  const arweave = Arweave.init({
+    host: 'ar-io.net',
+    port: 443,
+    protocol: 'https',
+  });
+  const wallet = readJWKFile(walletJwk);
+  const arDrive = arDriveFactory({ wallet, arweave });
+
+  const folderIds = new Map<string, string>();
+
+  // 1. Create the root drive
+  const createDriveResult = await arDrive.createPublicDrive({ driveName });
+  const rootFolderId = createDriveResult.rootFolderId;
+  folderIds.set(buildDir, rootFolderId);
+
+  // 2. Create folders (skip root)
+  const files = await getAllFiles(buildDir);
+  for (const filePath of files) {
+    const parentPath = path.dirname(filePath);
+    const parentFolderId = folderIds.get(parentPath);
+    if (!parentFolderId) throw new Error(`Parent folder ID not found for file ${filePath}`);
+
+    const contentType = getContentType(filePath);
+    const fileBuffer = fs.readFileSync(filePath);
+
+    await arDrive.uploadFile({
+      fileData: fileBuffer,
+      fileName: path.basename(filePath),
+      parentFolderId,
+      contentType,
+    });
+  }
+
+  return {
+    success: true,
+    transactionId: createDriveResult.driveId,
+    url: `https://app.ardrive.io/#/drives/${createDriveResult.driveId}`,
+    fileTransactions: {},
+    fileUrls: []
+  };
+};
+
+
+// Helper function to determine content type
+const getContentType = (filePath: string): string => {
+  const extension = path.extname(filePath).toLowerCase();
+  const contentTypes: Record<string, string> = {
+    '.html': 'text/html',
+    '.css': 'text/css',
+    '.js': 'application/javascript',
+    '.json': 'application/json',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf',
+    // Add more mappings as needed
+  };
+  return contentTypes[extension] || 'application/octet-stream';
+};
