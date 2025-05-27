@@ -20,6 +20,7 @@
     "formidable": "^3.5.4",
     "framer-motion": "^12.14.0",
     "fs-extra": "^11.3.0",
+    "lucide-react": "^0.511.0",
     "mime-types": "^3.0.1",
     "next": "15.1.0",
     "react": "^19.0.0",
